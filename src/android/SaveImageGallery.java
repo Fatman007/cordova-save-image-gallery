@@ -2,6 +2,8 @@ package com.agomezmoron.saveImageGallery;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.io.IOException;
 import java.util.Calendar;
 import java.util.Arrays;
 import java.util.List;
@@ -14,6 +16,8 @@ import org.json.JSONArray;
 import org.json.JSONException;
 
 import android.Manifest;
+import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
@@ -21,6 +25,7 @@ import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.provider.MediaStore;
 import android.util.Base64;
 import android.util.Log;
 
@@ -61,8 +66,8 @@ public class SaveImageGallery extends CordovaPlugin {
             this._args = args;
             this._callback = callbackContext;
 
-            if (PermissionHelper.hasPermission(this, WRITE_EXTERNAL_STORAGE)) {
-                Log.d("SaveImageGallery", "Permissions already granted, or Android version is lower than 6");
+            if (PermissionHelper.hasPermission(this, WRITE_EXTERNAL_STORAGE) || Build.VERSION.SDK_INT >= 30) {
+                Log.d("SaveImageGallery", "Permissions already granted, or Android version is 11 or higher");
                 saveBase64Image(this._args, this._callback);
             } else {
                 Log.d("SaveImageGallery", "Requesting permissions for WRITE_EXTERNAL_STORAGE");
@@ -133,116 +138,120 @@ public class SaveImageGallery extends CordovaPlugin {
         } else {
 
             // Save the image
-            File imageFile = savePhoto(bmp, filePrefix, format, quality);
+            Uri imageUri = savePhoto(bmp, filePrefix, format, quality);
 
-            if (imageFile == null) {
+            if (imageUri == null) {
                 callbackContext.error("Error while saving image");
             }
 
             // Update image gallery
-            if (mediaScannerEnabled) {
-                scanPhoto(imageFile);
+            if (mediaScannerEnabled && imageUri != null) {
+                scanPhoto(imageUri);
             }
 
-            String path = imageFile.toString();
-
-            if (!path.startsWith("file://")) {
-                path = "file://" + path;
-            }
-
-            callbackContext.success(path);
+            callbackContext.success(imageUri.toString());
         }
     }
 
     /**
      * Private method to save a {@link Bitmap} into the photo library/temp folder with a format, a prefix and with the given quality.
      */
-    private File savePhoto(Bitmap bmp, String prefix, String format, int quality) {
-        File retVal = null;
-
+    private Uri savePhoto(Bitmap bmp, String prefix, String format, int quality) {
+        OutputStream outStream = null;
+        Uri imageUri = null;
         try {
             Calendar c = Calendar.getInstance();
             String date = EMPTY_STR + c.get(Calendar.YEAR) + c.get(Calendar.MONTH) + c.get(Calendar.DAY_OF_MONTH)
                     + c.get(Calendar.HOUR_OF_DAY) + c.get(Calendar.MINUTE) + c.get(Calendar.SECOND);
 
-            File folder;
-
-            if (Build.VERSION.SDK_INT >= 30) {
-                // @see https://developer.android.com/about/versions/11/privacy/storage
-                folder = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.GINGERBREAD_MR1) {
-                folder = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES);
-            } else {
-                folder = Environment.getExternalStorageDirectory();
-            }
-
-            if (!folder.exists()) {
-                folder.mkdirs();
-            }
-
-            // building the filename
             String fileName = prefix + date;
             Bitmap.CompressFormat compressFormat = null;
+            String mimeType = "";
             // switch for String is not valid for java < 1.6, so we avoid it
             if (format.equalsIgnoreCase(JPG_FORMAT)) {
                 fileName += ".jpeg";
                 compressFormat = Bitmap.CompressFormat.JPEG;
+                mimeType = "image/jpeg";
             } else if (format.equalsIgnoreCase(PNG_FORMAT)) {
                 fileName += ".png";
                 compressFormat = Bitmap.CompressFormat.PNG;
+                mimeType = "image/png";
             } else {
                 // default case
                 fileName += ".jpeg";
                 compressFormat = Bitmap.CompressFormat.JPEG;
+                mimeType = "image/jpeg";
             }
 
-            // now we create the image in the folder
-            File imageFile = new File(folder, fileName);
-            FileOutputStream out = new FileOutputStream(imageFile);
-            // compress it
-            bmp.compress(compressFormat, quality, out);
-            out.flush();
-            out.close();
+            if (Build.VERSION.SDK_INT >= 29) {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
+                values.put(MediaStore.Images.Media.MIME_TYPE, mimeType);
+                values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES);
 
-            retVal = imageFile;
+                imageUri = cordova.getActivity().getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                if (imageUri != null) {
+                    outStream = cordova.getActivity().getContentResolver().openOutputStream(imageUri);
+                    bmp.compress(compressFormat, quality, outStream);
+                    outStream.close();
+                }
+            } else {
+                File folder = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES);
+                if (!folder.exists()) {
+                    folder.mkdirs();
+                }
+
+                File imageFile = new File(folder, fileName);
+                outStream = new FileOutputStream(imageFile);
+                bmp.compress(compressFormat, quality, outStream);
+                outStream.flush();
+                outStream.close();
+
+                imageUri = Uri.fromFile(imageFile);
+            }
 
         } catch (Exception e) {
-            Log.e("SaveImageToGallery", "An exception occured while saving image: " + e.toString());
+            Log.e("SaveImageToGallery", "An exception occurred while saving image: " + e.toString());
+        } finally {
+            if (outStream != null) {
+                try {
+                    outStream.close();
+                } catch (IOException e) {
+                    Log.e("SaveImageToGallery", "Error closing OutputStream: " + e.toString());
+                }
+            }
         }
 
-        return retVal;
+        return imageUri;
     }
 
     /**
      * Invoke the system's media scanner to add your photo to the Media Provider's database,
      * making it available in the Android Gallery application and to other apps.
      */
-    private void scanPhoto(File imageFile) {
+    private void scanPhoto(Uri imageUri) {
         Intent mediaScanIntent = new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE);
-        Uri contentUri = Uri.fromFile(imageFile);
-
-        mediaScanIntent.setData(contentUri);
-
+        mediaScanIntent.setData(imageUri);
         cordova.getActivity().sendBroadcast(mediaScanIntent);
     }
 
     /**
      * Callback from PermissionHelper.requestPermission method
      */
-	public void onRequestPermissionResult(int requestCode, String[] permissions, int[] grantResults) throws JSONException {
-		for (int r : grantResults) {
-			if (r == PackageManager.PERMISSION_DENIED) {
-				Log.d("SaveImageGallery", "Permission not granted by the user");
-				_callback.error("Permissions denied");
-				return;
-			}
-		}
+    public void onRequestPermissionResult(int requestCode, String[] permissions, int[] grantResults) throws JSONException {
+        for (int r : grantResults) {
+            if (r == PackageManager.PERMISSION_DENIED) {
+                Log.d("SaveImageGallery", "Permission not granted by the user");
+                _callback.error("Permissions denied");
+                return;
+            }
+        }
 
-		switch (requestCode) {
-		case WRITE_PERM_REQUEST_CODE:
-			Log.d("SaveImageGallery", "User granted the permission for WRITE_EXTERNAL_STORAGE");
+        switch (requestCode) {
+        case WRITE_PERM_REQUEST_CODE:
+            Log.d("SaveImageGallery", "User granted the permission for WRITE_EXTERNAL_STORAGE");
             saveBase64Image(this._args, this._callback);
-			break;
-		}
-	}
+            break;
+        }
+    }
 }
